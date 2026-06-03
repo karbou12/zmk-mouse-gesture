@@ -508,6 +508,11 @@ static int input_processor_mouse_gesture_handle_event(const struct device *dev,
         .value = event->value,
     };
 
+    struct input_processor_mouse_gesture_data *data = dev->data;
+    if (data->is_active) {
+        event->value = 0;
+    }
+
     if (k_msgq_put(&mouse_rel_msgq, &msg, K_MSEC(10)) != 0) {
         /* Queue full – drop smallest importance events */
         LOG_WRN("Mouse rel queue full – movement dropped");
