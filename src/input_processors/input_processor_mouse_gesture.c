@@ -29,10 +29,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
 
-#define MAX_GESTURE_SEQUENCE_LENGTH 8
-#define MAX_GESTURE_PATTERNS 16
 #define MAX_DEFERRED_BINDINGS 8
-#define MAX_GESTURE_TRIE_NODES (MAX_GESTURE_PATTERNS * MAX_GESTURE_SEQUENCE_LENGTH + 1)
 
 struct gesture_node {
     struct gesture_node *child[4];
@@ -53,19 +50,11 @@ struct input_processor_mouse_gesture_data {
     struct gesture_node *current_node;
     const struct device *dev;
 
-    struct gesture_node gesture_nodes_pool[MAX_GESTURE_TRIE_NODES];
     size_t gesture_nodes_count;
     struct gesture_node *gesture_trie_root;
 };
 
-static struct gesture_node *allocate_gesture_node(struct input_processor_mouse_gesture_data *data) {
-    if (data->gesture_nodes_count >= MAX_GESTURE_TRIE_NODES) {
-        return NULL;
-    }
-    struct gesture_node *node = &data->gesture_nodes_pool[data->gesture_nodes_count++];
-    memset(node, 0, sizeof(struct gesture_node));
-    return node;
-}
+static struct gesture_node *allocate_gesture_node(const struct device *dev);
 
 static int direction_to_index(uint8_t direction) {
     switch (direction) {
@@ -82,7 +71,7 @@ static int direction_to_index(uint8_t direction) {
     }
 }
 
-static void build_gesture_trie(struct input_processor_mouse_gesture_data *data, const struct gesture_pattern *patterns, size_t pattern_count);
+static void build_gesture_trie(const struct device *dev, const struct gesture_pattern *patterns, size_t pattern_count);
 
 /* Message queue definitions for gesture execution */
 struct gesture_exec_msg {
@@ -127,9 +116,10 @@ struct gesture_pattern {
     const uint8_t *pattern;
 };
 
-static void build_gesture_trie(struct input_processor_mouse_gesture_data *data, const struct gesture_pattern *patterns, size_t pattern_count) {
+static void build_gesture_trie(const struct device *dev, const struct gesture_pattern *patterns, size_t pattern_count) {
+    struct input_processor_mouse_gesture_data *data = dev->data;
     if (!data->gesture_trie_root) {
-        data->gesture_trie_root = allocate_gesture_node(data);
+        data->gesture_trie_root = allocate_gesture_node(dev);
         if (!data->gesture_trie_root) {
             return;
         }
@@ -145,7 +135,7 @@ static void build_gesture_trie(struct input_processor_mouse_gesture_data *data, 
                 break;
             }
             if (!node->child[idx]) {
-                node->child[idx] = allocate_gesture_node(data);
+                node->child[idx] = allocate_gesture_node(dev);
                 if (!node->child[idx]) {
                     node = NULL;
                     break;
@@ -166,12 +156,27 @@ struct input_processor_mouse_gesture_config {
     uint32_t gesture_cooldown_ms;  // Cooldown period between gestures
     bool enable_eager_mode;  // Execute bindings immediately when gesture pattern is matched
     bool always_active;
+    bool suppress_movement;  // Consume X/Y events while gesture is active
     uint32_t idle_timeout_ms;  // Time to wait for idle before invoking gesture
+    uint32_t partial_gesture_timeout_ms; // Discard a stale in-progress gesture after this much idle time
     uint16_t event_code_x;
     uint16_t event_code_y;
     const struct gesture_pattern *patterns;  // Array of pointers to patterns
     size_t pattern_count;
+    struct gesture_node *gesture_nodes_pool; // Backing storage for this instance's trie
+    size_t gesture_nodes_pool_len;
 };
+
+static struct gesture_node *allocate_gesture_node(const struct device *dev) {
+    const struct input_processor_mouse_gesture_config *config = dev->config;
+    struct input_processor_mouse_gesture_data *data = dev->data;
+    if (data->gesture_nodes_count >= config->gesture_nodes_pool_len) {
+        return NULL;
+    }
+    struct gesture_node *node = &config->gesture_nodes_pool[data->gesture_nodes_count++];
+    memset(node, 0, sizeof(struct gesture_node));
+    return node;
+}
 
 static void schedule_gesture_execution(const struct device *dev, const struct gesture_pattern *pattern);
 static void clear_gesture_data_locked(struct input_processor_mouse_gesture_data *data);
@@ -409,6 +414,14 @@ static int input_processor_mouse_gesture_handle_event_locked(const struct device
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
+    // Discard a stale, partially accumulated gesture.
+    if (config->partial_gesture_timeout_ms > 0 && data->last_movement_time > 0 &&
+        (current_time - data->last_movement_time) > (int64_t)config->partial_gesture_timeout_ms) {
+        LOG_DBG("Idle for %lldms, discarding stale gesture data",
+                current_time - data->last_movement_time);
+        clear_gesture_data_locked(data);
+    }
+
     // Accumulate with overflow protection
     if (event->code == config->event_code_x) {
         accumulate_movement_safe(&data->acc_x, event->value, "X");
@@ -508,17 +521,25 @@ static int input_processor_mouse_gesture_handle_event(const struct device *dev,
         .value = event->value,
     };
 
-    struct input_processor_mouse_gesture_data *data = dev->data;
-    if (data->is_active) {
-        event->value = 0;
-    }
-
     if (k_msgq_put(&mouse_rel_msgq, &msg, K_MSEC(10)) != 0) {
         /* Queue full – drop smallest importance events */
         LOG_WRN("Mouse rel queue full – movement dropped");
     }
 
     k_work_submit(&gesture_exec_work);
+
+    if (config->suppress_movement) {
+        struct input_processor_mouse_gesture_data *data = dev->data;
+        if (data->is_active) {
+            /* Zero the movement instead of returning ZMK_INPUT_PROC_STOP.
+             * On zmk's layer-override path, input_listener discards a STOP
+             * returned by the override chain (it returns 0 when process-next
+             * is unset), so the event reached HID untouched and the pointer
+             * kept moving. Writing 0 suppresses movement from anywhere in
+             * the chain. */
+            event->value = 0;
+        }
+    }
 
     return ZMK_INPUT_PROC_CONTINUE;
 }
@@ -531,7 +552,7 @@ static int input_processor_mouse_gesture_init(const struct device *dev) {
     const struct input_processor_mouse_gesture_config *config = dev->config;
     data->gesture_nodes_count = 0;
     data->gesture_trie_root = NULL;
-    build_gesture_trie(data, config->patterns, config->pattern_count);
+    build_gesture_trie(dev, config->patterns, config->pattern_count);
 
     k_mutex_init(&data->lock);
 
@@ -616,11 +637,16 @@ static const struct zmk_input_processor_driver_api input_processor_mouse_gesture
         .pattern = gesture_pattern_seq_##node_id,                                         \
     },
 
+/* Worst case (no shared prefixes) one trie node per stroke, plus the root. */
+#define GESTURE_PATTERN_LEN_PLUS(node_id) +DT_PROP_LEN(node_id, pattern)
+#define GESTURE_TRIE_NODE_COUNT(n) (1 DT_FOREACH_CHILD(DT_DRV_INST(n), GESTURE_PATTERN_LEN_PLUS))
+
 #define MOUSE_GESTURE_INPUT_PROCESSOR_INST(n)                                                         \
     DT_FOREACH_CHILD(DT_DRV_INST(n), DECLARE_GESTURE_CHILD)                                           \
     static const struct gesture_pattern gesture_patterns_##n[] = {                                    \
         DT_FOREACH_CHILD(DT_DRV_INST(n), GESTURE_PATTERN_ENTRY)                                       \
     };                                                                                                \
+    static struct gesture_node gesture_trie_nodes_##n[GESTURE_TRIE_NODE_COUNT(n)];                    \
     static struct input_processor_mouse_gesture_data                                                  \
         input_processor_mouse_gesture_data_##n = {};                                                  \
     static const struct input_processor_mouse_gesture_config                                          \
@@ -630,10 +656,14 @@ static const struct zmk_input_processor_driver_api input_processor_mouse_gesture
         .gesture_cooldown_ms = DT_INST_PROP_OR(n, gesture_cooldown_ms, 500),                          \
         .enable_eager_mode = DT_INST_PROP_OR(n, enable_eager_mode, false),                            \
         .always_active = DT_INST_PROP_OR(n, always_active, false),                                    \
+        .suppress_movement = DT_INST_PROP_OR(n, suppress_movement, false),                            \
         .idle_timeout_ms = DT_INST_PROP_OR(n, idle_timeout_ms, 150),                                  \
+        .partial_gesture_timeout_ms = DT_INST_PROP_OR(n, partial_gesture_timeout_ms, 400),            \
         .event_code_x = (uint16_t)DT_INST_PROP_OR(n, event_code_x, INPUT_REL_X),                          \
         .event_code_y = (uint16_t)DT_INST_PROP_OR(n, event_code_y, INPUT_REL_Y),                          \
         .patterns = gesture_patterns_##n,                                                             \
+        .gesture_nodes_pool = gesture_trie_nodes_##n,                                                 \
+        .gesture_nodes_pool_len = ARRAY_SIZE(gesture_trie_nodes_##n),                                 \
         .pattern_count = ARRAY_SIZE(gesture_patterns_##n),                                            \
     };                                                                                                \
     DEVICE_DT_INST_DEFINE(n, input_processor_mouse_gesture_init, NULL,                                \
